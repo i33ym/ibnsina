@@ -14,7 +14,7 @@ var (
 	}
 
 	defaultMethodNotAllowed = func(ctx context.Context, response http.ResponseWriter, request *http.Request) {
-		response.Write([]byte("the method " + request.Method + " is not supported for the requested resource"))
+		response.Write([]byte("the method " + request.Method + " is not supported for the requested resource\n"))
 	}
 
 	defaultOptions = func(ctx context.Context, response http.ResponseWriter, request *http.Request) {
