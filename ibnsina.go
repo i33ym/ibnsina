@@ -10,10 +10,12 @@ import (
 
 var (
 	defaultNotFound = func(ctx context.Context, response http.ResponseWriter, request *http.Request) {
+		response.WriteHeader(http.StatusNotFound)
 		response.Write([]byte("the requested resource could not be found\n"))
 	}
 
 	defaultMethodNotAllowed = func(ctx context.Context, response http.ResponseWriter, request *http.Request) {
+		response.WriteHeader(http.StatusMethodNotAllowed)
 		response.Write([]byte("the method " + request.Method + " is not supported for the requested resource\n"))
 	}
 
@@ -21,17 +23,7 @@ var (
 		response.WriteHeader(http.StatusNoContent)
 	}
 
-	allMethods = []string{
-		http.MethodConnect,
-		http.MethodDelete,
-		http.MethodGet,
-		http.MethodHead,
-		http.MethodOptions,
-		http.MethodPatch,
-		http.MethodPost,
-		http.MethodPut,
-		http.MethodTrace,
-	}
+	allMethods = []string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodConnect, http.MethodOptions, http.MethodTrace}
 
 	rxPatterns = map[string]*regexp.Regexp{}
 )
@@ -49,12 +41,14 @@ func Param(ctx context.Context, name string) string {
 
 type Handler func(context.Context, http.ResponseWriter, *http.Request)
 
+type Middleware func(Handler) Handler
+
 type Router struct {
 	NotFound         Handler
 	MethodNotAllowed Handler
 	Options          Handler
 	routes           []*route
-	middlewares      []func(Handler) Handler
+	middlewares      []Middleware
 }
 
 func NewRouter() *Router {
@@ -63,6 +57,7 @@ func NewRouter() *Router {
 		MethodNotAllowed: defaultMethodNotAllowed,
 		Options:          defaultOptions,
 		routes:           []*route{},
+		// middlewares:      []Middleware{},
 	}
 }
 
@@ -82,18 +77,18 @@ func (router *Router) ServeHTTP(response http.ResponseWriter, request *http.Requ
 				methods = append(methods, router.routes[index].method)
 			}
 		}
+	}
 
-		if len(methods) > 0 {
-			response.Header().Set("Allow", strings.Join(append(methods, http.MethodOptions), ", "))
+	if len(methods) > 0 {
+		response.Header().Set("Allow", strings.Join(append(methods, http.MethodOptions), ", "))
 
-			if request.Method == http.MethodOptions {
-				router.wrap(router.Options)(context.Background(), response, request)
-			} else {
-				router.wrap(router.MethodNotAllowed)(context.Background(), response, request)
-			}
-
-			return
+		if request.Method == http.MethodOptions {
+			router.wrap(router.Options)(context.Background(), response, request)
+		} else {
+			router.wrap(router.MethodNotAllowed)(context.Background(), response, request)
 		}
+
+		return
 	}
 
 	router.wrap(router.NotFound)(context.Background(), response, request)
@@ -122,7 +117,7 @@ func (router *Router) Handle(path string, handler Handler, methods ...string) {
 			method:   strings.ToUpper(methods[index]),
 			segments: segments,
 			wildcard: strings.HasSuffix(path, "/..."),
-			handler:  handler,
+			handler:  router.wrap(handler),
 		}
 
 		router.routes = append(router.routes, route)
@@ -137,30 +132,40 @@ func (router *Router) Handle(path string, handler Handler, methods ...string) {
 	}
 }
 
+func (router *Router) Use(middlewares ...Middleware) {
+	router.middlewares = append(router.middlewares, middlewares...)
+}
+
+// func (router *Router) Group(fn func(*Router)) {
+// 	mux := *router
+// 	fn(&mux)
+// }
+
 func (route *route) match(ctx context.Context, segments []string) (context.Context, bool) {
-	if !route.wildcard && len(route.segments) != len(segments) {
+	if !route.wildcard && len(segments) != len(route.segments) {
 		return ctx, false
 	}
 
-	for index := 0; index < len(route.segments); index++ {
+	for index, rs := range route.segments {
 		if index > len(segments)-1 {
 			return ctx, false
 		}
 
-		if route.segments[index] == "..." {
+		if rs == "..." {
 			ctx = context.WithValue(ctx, contextKey("..."), strings.Join(segments[index:], "/"))
 			return ctx, true
 		}
 
-		if strings.HasPrefix(route.segments[index], ":") {
-			key, rx, contains := strings.Cut(strings.TrimPrefix(route.segments[index], ":"), "|")
-
+		if strings.HasPrefix(rs, ":") {
+			key, rx, contains := strings.Cut(strings.TrimPrefix(rs, ":"), "|")
 			if contains {
 				if rxPatterns[rx].MatchString(segments[index]) {
 					ctx = context.WithValue(ctx, contextKey(key), segments[index])
 					continue
 				}
-			} else if segments[index] != "" {
+			}
+
+			if !contains && segments[index] != "" {
 				ctx = context.WithValue(ctx, contextKey(key), segments[index])
 				continue
 			}
@@ -168,7 +173,7 @@ func (route *route) match(ctx context.Context, segments []string) (context.Conte
 			return ctx, false
 		}
 
-		if segments[index] != route.segments[index] {
+		if rs != segments[index] {
 			return ctx, false
 		}
 	}
