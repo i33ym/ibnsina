@@ -2,11 +2,19 @@ package ibnsina
 
 import (
 	"context"
+	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"regexp"
 	"slices"
 	"strings"
+	"time"
+
+	"github.com/pborman/uuid"
 )
+
+const TraceIDHeader = "X-Trace-ID"
 
 var (
 	defaultNotFound = func(ctx context.Context, response http.ResponseWriter, request *http.Request) {
@@ -28,10 +36,57 @@ var (
 	rxPatterns = map[string]*regexp.Regexp{}
 )
 
-type contextKey string
+type ctxKey string
+
+type Values struct {
+	TraceID string
+	Now     time.Time
+	Status  int
+}
+
+type contextKey int
+
+func (router *Router) Run(addr string, timeout time.Duration, logger *log.Logger) error {
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      router,
+		ReadTimeout:  timeout,
+		WriteTimeout: timeout,
+		IdleTimeout:  timeout,
+		ErrorLog:     logger,
+	}
+
+	errs := make(chan error, 1)
+
+	go func() {
+		errs <- srv.ListenAndServe()
+	}()
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt)
+
+	select {
+	case err := <-errs:
+		return err
+	case <-signals:
+		timeout := 5 * time.Second
+
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		if err := srv.Shutdown(ctx); err != nil {
+			// kill 9: kill hard
+			if err := srv.Close(); err != nil {
+				return err
+			}
+		}
+
+		return <-errs
+	}
+}
 
 func Param(ctx context.Context, name string) string {
-	value, ok := ctx.Value(contextKey(name)).(string)
+	value, ok := ctx.Value(ctxKey(name)).(string)
 	if !ok {
 		return ""
 	}
@@ -51,13 +106,13 @@ type Router struct {
 	middlewares      []Middleware
 }
 
-func NewRouter() *Router {
+func NewRouter(middlewares ...Middleware) *Router {
 	return &Router{
 		NotFound:         defaultNotFound,
 		MethodNotAllowed: defaultMethodNotAllowed,
 		Options:          defaultOptions,
 		routes:           []*route{},
-		// middlewares:      []Middleware{},
+		middlewares:      middlewares,
 	}
 }
 
@@ -65,11 +120,20 @@ func (router *Router) ServeHTTP(response http.ResponseWriter, request *http.Requ
 	segments := strings.Split(request.URL.EscapedPath(), "/")
 	methods := []string{}
 
+	values := Values{
+		TraceID: uuid.New(),
+		Now:     time.Now(),
+	}
+
+	response.Header().Set(TraceIDHeader, values.TraceID)
+
+	ctx := context.WithValue(request.Context(), contextKey(1), values)
+
 	for index := 0; index < len(router.routes); index++ {
-		ctx, ok := router.routes[index].match(request.Context(), segments)
+		c, ok := router.routes[index].match(request.Context(), segments)
 		if ok {
 			if request.Method == router.routes[index].method {
-				router.routes[index].handler(context.Background(), response, request.WithContext(ctx))
+				router.routes[index].handler(ctx, response, request.WithContext(c))
 				return
 			}
 
@@ -83,15 +147,15 @@ func (router *Router) ServeHTTP(response http.ResponseWriter, request *http.Requ
 		response.Header().Set("Allow", strings.Join(append(methods, http.MethodOptions), ", "))
 
 		if request.Method == http.MethodOptions {
-			router.wrap(router.Options)(context.Background(), response, request)
+			router.wrap(router.Options)(ctx, response, request)
 		} else {
-			router.wrap(router.MethodNotAllowed)(context.Background(), response, request)
+			router.wrap(router.MethodNotAllowed)(ctx, response, request)
 		}
 
 		return
 	}
 
-	router.wrap(router.NotFound)(context.Background(), response, request)
+	router.wrap(router.NotFound)(ctx, response, request)
 }
 
 type route struct {
@@ -136,10 +200,21 @@ func (router *Router) Use(middlewares ...Middleware) {
 	router.middlewares = append(router.middlewares, middlewares...)
 }
 
-// func (router *Router) Group(fn func(*Router)) {
-// 	mux := *router
-// 	fn(&mux)
-// }
+type Group struct {
+	router      *Router
+	middlewares []Middleware
+}
+
+func (router *Router) Group(middlewares ...Middleware) *Group {
+	return &Group{
+		router:      router,
+		middlewares: middlewares,
+	}
+}
+
+func (group *Group) Handle(path string, handler Handler, methods ...string) {
+	group.router.Handle(path, group.router.wrap(handler), methods...)
+}
 
 func (route *route) match(ctx context.Context, segments []string) (context.Context, bool) {
 	if !route.wildcard && len(segments) != len(route.segments) {
@@ -152,7 +227,7 @@ func (route *route) match(ctx context.Context, segments []string) (context.Conte
 		}
 
 		if rs == "..." {
-			ctx = context.WithValue(ctx, contextKey("..."), strings.Join(segments[index:], "/"))
+			ctx = context.WithValue(ctx, ctxKey("..."), strings.Join(segments[index:], "/"))
 			return ctx, true
 		}
 
@@ -160,13 +235,13 @@ func (route *route) match(ctx context.Context, segments []string) (context.Conte
 			key, rx, contains := strings.Cut(strings.TrimPrefix(rs, ":"), "|")
 			if contains {
 				if rxPatterns[rx].MatchString(segments[index]) {
-					ctx = context.WithValue(ctx, contextKey(key), segments[index])
+					ctx = context.WithValue(ctx, ctxKey(key), segments[index])
 					continue
 				}
 			}
 
 			if !contains && segments[index] != "" {
-				ctx = context.WithValue(ctx, contextKey(key), segments[index])
+				ctx = context.WithValue(ctx, ctxKey(key), segments[index])
 				continue
 			}
 

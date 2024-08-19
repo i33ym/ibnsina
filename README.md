@@ -1,6 +1,8 @@
 # ibnsina
 solid http router for go
 
+### warning: unit tests are still largely incomplete
+
 # coming up
 - session manager that supports redis & mysql
 - robust json reader and responder
